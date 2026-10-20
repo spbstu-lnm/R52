@@ -10,7 +10,11 @@ def main():
     args = parse_args()
 
     # Load binary
-    project = angr.Project(args.binary, auto_load_libs=False)
+    project = angr.Project(
+        args.binary,
+        ld_path=['/usr/lib/wine/i386-windows/'],
+        #auto_load_libs=False,
+    )
 
     # Check that angr identified it correctly
     print(project.arch)      # architecture (e.g. <Arch AMD64 (LE)>)
