@@ -1,12 +1,13 @@
-"""PEB read finder for IDA Pro 9.3.
+"""PEB Access Finder for IDA Pro 9.3 (IDAPython).
 
 Finds:
-  1) reads of the TEB.Peb pointer slot: FS:[0x30] / GS:[0x60];
-  2) likely reads/accesses through registers derived from that pointer.
+  * reads of the TEB.Peb slot (FS:[30h] / GS:[60h]);
+  * accesses through registers derived from that pointer (CFG-based tracking);
+  * WinAPI/NTAPI calls related to the PEB, debugger checks and the loader;
+  * strings with API names (candidates for GetProcAddress resolution).
 
-Also flags APIs that expose/query PEB-related state or are commonly used for anti-debugging. API hits are classified as direct, query, loader, or weak indicators; an API call alone is not proof of a raw PEB read.
-
-The script does not modify the IDB. Results are printed to IDA's Output window.
+An API hit alone is not proof of a raw PEB read. The database is not modified.
+Usage: File -> Script file...
 """
 
 import re
@@ -14,589 +15,455 @@ import re
 import ida_bytes
 import ida_funcs
 import ida_gdl
+import ida_kernwin
 import ida_lines
+import ida_segment
 import idautils
 import idc
 
 
-# IDA's usual x86 text rendering: fs:30h, fs:[30h], gs:60h, gs:[60h], etc.
-_SEGMENT_PEB_RE = re.compile(
-    r"\b(fs|gs)\s*:\s*(?:(?:byte|word|dword|qword|tbyte|xmmword|ymmword|zmmword)\s+ptr\s*)?"
-    r"\[?\s*(0x[0-9a-f]+|[0-9a-f]+h|\d+)\b",
-    re.IGNORECASE,
-)
+# ---------------------------------------------------------------------------
+#   Configuration
+# ---------------------------------------------------------------------------
 
+TITLE = "PEB Access Finder"
+LOG_TAG = "[PEB]"
 
-# Canonicalize register aliases, so EAX/RAX count as the same register family.
-_REG_FAMILY = {}
+# Direct reads of the slot:  PEB_PTR_LOAD / PEB_SLOT_READ / PEB_SLOT_RMW.
+# Via derived registers:     PEB_FIELD_READ / PEB_FIELD_RMW.
+# Category -> (API names, short explanation of the evidence).
+API_CATEGORIES = {
+    "WINAPI_PEB_ACCESS": (
+        ("RtlGetCurrentPeb",),
+        "returns the PEB pointer (strongest API-level indicator)"),
+    "WINAPI_TEB_ACCESS": (
+        ("RtlGetCurrentTeb", "NtCurrentTeb"),
+        "returns the TEB, which holds the PEB pointer"),
+    "WINAPI_PEB_QUERY": (
+        ("NtQueryInformationProcess", "ZwQueryInformationProcess"),
+        "class 0 returns PebBaseAddress, class 7 is a debug-port check"),
+    "WINAPI_ANTI_DEBUG": (
+        ("IsDebuggerPresent", "CheckRemoteDebuggerPresent",
+         "NtSetInformationThread", "ZwSetInformationThread"),
+        "debugger check / ThreadHideFromDebugger"),
+    "WINAPI_DEBUG_QUERY": (
+        ("NtQuerySystemInformation", "ZwQuerySystemInformation",
+         "RtlQueryProcessDebugInformation"),
+        "system/process debug information queries"),
+    "WINAPI_DEBUG_RELATED": (
+        ("OutputDebugStringA", "OutputDebugStringW"),
+        "sends a string to the debugger"),
+    "WINAPI_LOADER": (
+        ("GetModuleHandleA", "GetModuleHandleW", "GetModuleHandleExA", "GetModuleHandleExW",
+         "LdrGetDllHandle", "LdrGetDllHandleEx", "LdrEnumerateLoadedModules", "LdrLoadDll",
+         "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW"),
+        "loader state (PEB.Ldr); weak indicator"),
+    "WINAPI_API_RESOLUTION": (
+        ("GetProcAddress", "LdrGetProcedureAddress"),
+        "dynamic API resolution; may hide further calls"),
+    "WINAPI_PROCESS_PARAMETERS": (
+        ("GetCommandLineA", "GetCommandLineW"),
+        "process parameters (PEB.ProcessParameters); weak indicator"),
+}
 
-def _register_family(canonical, aliases):
-    for alias in aliases:
-        _REG_FAMILY[alias] = canonical
-
-
-_register_family("rax", ["rax", "eax", "ax", "al", "ah"])
-_register_family("rbx", ["rbx", "ebx", "bx", "bl", "bh"])
-_register_family("rcx", ["rcx", "ecx", "cx", "cl", "ch"])
-_register_family("rdx", ["rdx", "edx", "dx", "dl", "dh"])
-_register_family("rsi", ["rsi", "esi", "si", "sil"])
-_register_family("rdi", ["rdi", "edi", "di", "dil"])
-_register_family("rbp", ["rbp", "ebp", "bp", "bpl"])
-_register_family("rsp", ["rsp", "esp", "sp", "spl"])
+# Registers are tracked by family, so EAX/AX/AL count as RAX.
+_FAMILIES = {
+    "rax": "rax eax ax al ah", "rbx": "rbx ebx bx bl bh",
+    "rcx": "rcx ecx cx cl ch", "rdx": "rdx edx dx dl dh",
+    "rsi": "rsi esi si sil", "rdi": "rdi edi di dil",
+    "rbp": "rbp ebp bp bpl", "rsp": "rsp esp sp spl",
+}
 for _n in range(8, 16):
-    _register_family("r%d" % _n, ["r%d" % _n, "r%dd" % _n, "r%dw" % _n, "r%db" % _n])
+    _FAMILIES["r%d" % _n] = "r{0} r{0}d r{0}w r{0}b".format(_n)
+REG_FAMILY = {alias: family for family, aliases in _FAMILIES.items() for alias in aliases.split()}
 
-_REG_TOKEN_RE = re.compile(
-    r"\b(" + "|".join(sorted(_REG_FAMILY.keys(), key=len, reverse=True)) + r")\b",
+REG_TOKEN_RE = re.compile(
+    r"\b(" + "|".join(sorted(REG_FAMILY, key=len, reverse=True)) + r")\b", re.IGNORECASE)
+
+# IDA prints fs:30h, fs:[30h], large fs:30h, gs:qword ptr [60h], ...
+SEGMENT_SLOT_RE = re.compile(
+    r"\b(fs|gs)\s*:\s*(?:(?:byte|word|dword|qword|tbyte|xmmword|ymmword|zmmword)\s+ptr\s*)?"
+    r"\[?\s*(0x[0-9a-f]+|[0-9a-f]+h|\d+)\b(?!\s*[-+*])",
     re.IGNORECASE,
 )
+API_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_@$?.!]*")
+API_PREFIXES = ("__imp_", "_imp_", "imp_", "j_")
 
-# Instructions in which operand 0 is not written (or only flags/implicit state change).
-_NO_DEST_WRITE = {
+# Instructions whose first operand is not written.
+NO_DEST_WRITE = {
     "cmp", "test", "push", "call", "jmp", "ret", "retn", "retf", "iret", "iretd", "iretq",
     "nop", "pause", "int", "int1", "int3", "into", "syscall", "sysenter", "sysexit", "ud2",
     "bt", "prefetch", "prefetchnta", "prefetcht0", "prefetcht1", "prefetcht2",
 }
+# Read-modify-write instructions (first operand is read and written).
+RMW_MNEMONICS = {
+    "add", "adc", "sub", "sbb", "and", "or", "xor", "inc", "dec", "neg", "not",
+    "shl", "sal", "shr", "sar", "rol", "ror", "rcl", "rcr", "xchg", "xadd",
+    "cmpxchg", "bts", "btr", "btc", "shld", "shrd",
+}
+CALL_CLOBBERED = {"rax", "rcx", "rdx", "r8", "r9", "r10", "r11"}
+COPY_MNEMONICS = {"mov", "movabs"}
+MAX_OPERANDS = 8
 
-# A call may overwrite caller-saved registers. These are cleared from the analysis state.
-_CALL_CLOBBERED = {"rax", "rcx", "rdx", "r8", "r9", "r10", "r11"}
+COLUMNS = [
+    ["Category", 26],
+    ["Function", 28],
+    ["Detail", 60],
+    ["Disassembly", 40],
+]
 
-_COPY_MNEMONICS = {"mov", "movabs"}
+# lowercase API name -> (canonical name, category)
+API_LOOKUP = {
+    name.lower(): (name, category)
+    for category, (names, _) in API_CATEGORIES.items() for name in names
+}
 
-
-RESULTS = {}  # ea -> list[(category, detail)]
-
-
-def _parse_number(token):
-    token = token.strip().lower()
-    if token.startswith("0x"):
-        return int(token, 16)
-    if token.endswith("h"):
-        return int(token[:-1], 16)
-    # IDA normally prints offsets in hex (with an h suffix); bare numbers are decimal.
-    return int(token, 10)
-
-
-def _peb_segment_operand(operand):
-    """Return ('fs'/'gs', offset) only for the standard PEB pointer slots."""
-    match = _SEGMENT_PEB_RE.search(operand or "")
-    if not match:
-        return None
-    segment = match.group(1).lower()
-    try:
-        offset = _parse_number(match.group(2))
-    except ValueError:
-        return None
-    if (segment == "fs" and offset == 0x30) or (segment == "gs" and offset == 0x60):
-        return segment, offset
-    return None
+_chooser = None  # keep a reference while the window is open
 
 
-def _get_operands(ea):
-    operands = []
-    for i in range(8):
-        text = idc.print_operand(ea, i)
+# ---------------------------------------------------------------------------
+#   Helpers
+# ---------------------------------------------------------------------------
+
+class ScanCancelled(Exception):
+    pass
+
+
+def log(message):
+    ida_kernwin.msg("%s %s\n" % (LOG_TAG, message))
+
+
+def disasm(ea):
+    line = idc.generate_disasm_line(ea, 0) or ""
+    return ida_lines.tag_remove(line).strip()
+
+
+def func_name(ea):
+    return idc.get_func_name(ea) or "<no function>"
+
+
+def is_code(ea):
+    return ida_bytes.is_code(ida_bytes.get_flags(ea))
+
+
+def iter_insns(start_ea=None, end_ea=None):
+    """Yield code heads (executable segments by default); raise ScanCancelled on Cancel."""
+    count = 0
+    ranges = [(start_ea, end_ea)] if start_ea is not None else []
+    if not ranges:
+        for seg_ea in idautils.Segments():
+            seg = ida_segment.getseg(seg_ea)
+            if seg is not None and ((seg.perm & ida_segment.SEGPERM_EXEC)
+                                    or seg.type == ida_segment.SEG_CODE):
+                ranges.append((seg.start_ea, seg.end_ea))
+    for start, end in ranges:
+        for ea in idautils.Heads(start, end):
+            count += 1
+            if count % 4096 == 0 and ida_kernwin.user_cancelled():
+                raise ScanCancelled()
+            if is_code(ea):
+                yield ea
+
+
+def get_instruction(ea):
+    """Return (mnemonic, [operand texts]); mnemonic is '' for non-instructions."""
+    mnem = (idc.print_insn_mnem(ea) or "").lower().strip()
+    if not mnem:
+        return "", []
+    ops = []
+    for index in range(MAX_OPERANDS):
+        text = idc.print_operand(ea, index)
         if not text:
             break
-        operands.append(text.strip())
-    return operands
+        ops.append(text.strip())
+    return mnem, ops
 
 
-def _get_instruction(ea):
-    mnemonic = (idc.print_insn_mnem(ea) or "").lower().strip()
-    if not mnemonic:
-        return None, []
-    return mnemonic, _get_operands(ea)
+def reg_family(operand):
+    return REG_FAMILY.get((operand or "").strip().lower())
 
 
-def _reg_family(operand):
-    text = (operand or "").strip().lower()
-    if text in _REG_FAMILY:
-        return _REG_FAMILY[text]
-    return None
-
-
-def _memory_registers(operand):
-    """Return register families explicitly used inside [...] in an operand."""
+def memory_registers(operand):
+    """Register families used inside [...] of an operand."""
     text = operand or ""
-    left = text.find("[")
-    right = text.rfind("]")
+    left, right = text.find("["), text.rfind("]")
     if left < 0 or right <= left:
         return set()
-    expression = text[left + 1:right]
-    return {_REG_FAMILY[token.lower()] for token in _REG_TOKEN_RE.findall(expression)}
+    return {REG_FAMILY[t.lower()] for t in REG_TOKEN_RE.findall(text[left + 1:right])}
 
 
-def _memory_access_mode(mnemonic, operand_index):
-    """Classify explicit memory operands. None means operand 0 is write-only or LEA."""
-    if mnemonic == "lea":
+def memory_access_mode(mnem, index):
+    """'R', 'R/W', or None when the operand is only written (or is LEA)."""
+    if mnem == "lea":
         return None
-    if operand_index == 0:
-        # These instructions write their first explicit memory operand without reading it.
-        if mnemonic.startswith("mov") or mnemonic.startswith("set") or mnemonic == "pop":
+    if index == 0:
+        if mnem.startswith(("mov", "set")) or mnem == "pop":
             return None
-        # Common read/modify/write instructions.
-        if mnemonic in {
-            "add", "adc", "sub", "sbb", "and", "or", "xor", "inc", "dec", "neg", "not",
-            "shl", "sal", "shr", "sar", "rol", "ror", "rcl", "rcr", "xchg", "xadd",
-            "cmpxchg", "bts", "btr", "btc", "shld", "shrd",
-        }:
+        if mnem in RMW_MNEMONICS:
             return "R/W"
     return "R"
 
 
-def _is_code(ea):
+def peb_slot(operand):
+    """Return (segment, offset) for FS:[30h] / GS:[60h], else None."""
+    match = SEGMENT_SLOT_RE.search(operand or "")
+    if not match:
+        return None
+    segment, token = match.group(1).lower(), match.group(2).lower()
     try:
-        return ida_bytes.is_code(ida_bytes.get_full_flags(ea))
-    except Exception:
-        return bool(idc.print_insn_mnem(ea))
+        if token.startswith("0x"):
+            offset = int(token, 16)
+        elif token.endswith("h"):
+            offset = int(token[:-1], 16)
+        else:
+            offset = int(token, 10)
+    except ValueError:
+        return None
+    if (segment, offset) in (("fs", 0x30), ("gs", 0x60)):
+        return segment, offset
+    return None
 
 
-def _instruction_addresses(start_ea, end_ea):
-    for ea in idautils.Heads(start_ea, end_ea):
-        if _is_code(ea):
-            yield ea
+def is_peb_ptr_load(mnem, ops):
+    """mov reg, fs:[30h] and similar."""
+    return (mnem in COPY_MNEMONICS and len(ops) > 1 and reg_family(ops[0]) is not None
+            and any(peb_slot(op) for op in ops[1:]))
 
 
-def _add_result(ea, category, detail):
-    items = RESULTS.setdefault(ea, [])
-    value = (category, detail)
-    if value not in items:
-        items.append(value)
-
-
-def _scan_direct_peb_slots():
-    """Search all code segments, including code not currently assigned to a function."""
-    for seg_start in idautils.Segments():
-        seg_end = idc.get_segm_end(seg_start)
-        for ea in _instruction_addresses(seg_start, seg_end):
-            mnemonic, operands = _get_instruction(ea)
-            if not mnemonic:
-                continue
-            for index, operand in enumerate(operands):
-                peb_slot = _peb_segment_operand(operand)
-                if peb_slot is None:
-                    continue
-                mode = _memory_access_mode(mnemonic, index)
-                if mode is None:
-                    continue
-                segment, offset = peb_slot
-                if index > 0 and mnemonic in _COPY_MNEMONICS and _reg_family(operands[0]):
-                    category = "PEB_PTR_LOAD"
-                elif mode == "R/W":
-                    category = "PEB_SLOT_RMW"
-                else:
-                    category = "PEB_SLOT_READ"
-                _add_result(
-                    ea,
-                    category,
-                    "operand %d=%s (%s:[0x%X], %s)" % (index, operand, segment.upper(), offset, mode),
-                )
-
-
-def _writes_operand0(mnemonic):
-    if not mnemonic:
-        return False
-    if mnemonic in _NO_DEST_WRITE or mnemonic.startswith("j") or mnemonic.startswith("loop"):
-        return False
-    return True
-
-
-def _transfer_block(instructions, initial_state):
-    """Forward may-analysis: set of registers that may still point into/from the PEB."""
-    state = set(initial_state)
-    for ea in instructions:
-        mnemonic, operands = _get_instruction(ea)
-        if not mnemonic:
-            continue
-
-        if mnemonic == "call":
-            state.difference_update(_CALL_CLOBBERED)
-            continue
-
-        if not operands:
-            continue
-        dest = _reg_family(operands[0])
-        if not dest:
-            continue
-
-        direct_pointer_load = (
-            mnemonic in _COPY_MNEMONICS
-            and any(index > 0 and _peb_segment_operand(op) is not None for index, op in enumerate(operands))
-        )
-        copy_from_tracked_reg = (
-            mnemonic in _COPY_MNEMONICS
-            and len(operands) > 1
-            and _reg_family(operands[1]) in state
-        )
-        lea_from_tracked_reg = (
-            mnemonic == "lea"
-            and any(_memory_registers(op) & state for op in operands[1:])
-        )
-
-        if direct_pointer_load or copy_from_tracked_reg or lea_from_tracked_reg:
-            state.add(dest)
-        elif mnemonic.startswith("cmov"):
-            # Conditional move may keep the old destination or copy a tracked source.
-            if len(operands) > 1 and _reg_family(operands[1]) in state:
-                state.add(dest)
-        elif _writes_operand0(mnemonic):
-            state.discard(dest)
-
-    return state
-
-
-def _find_indirect_peb_accesses():
-    """Track PEB-derived registers between basic blocks in each analyzed function."""
-    for func_ea in idautils.Functions():
-        func = ida_funcs.get_func(func_ea)
-        if not func:
-            continue
-        try:
-            flow = ida_gdl.FlowChart(func)
-            blocks = list(flow)
-        except Exception as exc:
-            print("[PEB-Finder] Cannot build CFG for %s: %s" % (hex(func_ea), exc))
-            continue
-        if not blocks:
-            continue
-
-        block_by_id = {block.id: block for block in blocks}
-        instructions = {}
-        predecessors = {}
-        for block in blocks:
-            instructions[block.id] = list(_instruction_addresses(block.start_ea, block.end_ea))
-            try:
-                predecessors[block.id] = [pred.id for pred in block.preds() if pred.id in block_by_id]
-            except Exception:
-                predecessors[block.id] = []
-
-        in_states = {block.id: set() for block in blocks}
-        out_states = {block.id: set() for block in blocks}
-
-        # The lattice is finite (register families only), so this reaches a fixed point.
-        changed = True
-        while changed:
-            changed = False
-            for block in blocks:
-                incoming = set()
-                for pred_id in predecessors[block.id]:
-                    incoming.update(out_states[pred_id])
-                outgoing = _transfer_block(instructions[block.id], incoming)
-                if incoming != in_states[block.id] or outgoing != out_states[block.id]:
-                    in_states[block.id] = incoming
-                    out_states[block.id] = outgoing
-                    changed = True
-
-        # Re-run each block with its final IN state and report memory reads through tracked regs.
-        for block in blocks:
-            state = set(in_states[block.id])
-            for ea in instructions[block.id]:
-                mnemonic, operands = _get_instruction(ea)
-                if not mnemonic:
-                    continue
-
-                for index, operand in enumerate(operands):
-                    mode = _memory_access_mode(mnemonic, index)
-                    if mode is None:
-                        continue
-                    bases = _memory_registers(operand) & state
-                    if not bases:
-                        continue
-                    category = "PEB_FIELD_READ" if mode == "R" else "PEB_FIELD_RMW"
-                    _add_result(
-                        ea,
-                        category,
-                        "operand %d=%s; PEB-derived register(s)=%s; mode=%s"
-                        % (index, operand, ",".join(sorted(bases)), mode),
-                    )
-
-                # Keep the state transfer identical to the fixed-point pass.
-                state = _transfer_block([ea], state)
-
-
-
-# APIs are grouped by the kind of evidence their use provides.  An API hit is
-# not the same as a raw PEB dereference; see each rule's explanation.
-_API_RULES = {
-    "IsDebuggerPresent": (
-        "WINAPI_ANTI_DEBUG",
-        "Checks whether the calling process is being debugged. Commonly associated with PEB.BeingDebugged, but the call alone does not prove that this module directly reads the PEB.",
-    ),
-    "CheckRemoteDebuggerPresent": (
-        "WINAPI_ANTI_DEBUG",
-        "Checks whether the specified process is being debugged; this is an anti-debugging indicator, not proof of a direct PEB read by the caller.",
-    ),
-    "NtQueryInformationProcess": (
-        "WINAPI_PEB_QUERY",
-        "Native process query. ProcessBasicInformation (class 0) returns a structure containing PebBaseAddress; ProcessDebugPort (class 7) is also used for anti-debugging. The information class is not inferred here.",
-    ),
-    "ZwQueryInformationProcess": (
-        "WINAPI_PEB_QUERY",
-        "Native process query. ProcessBasicInformation (class 0) returns a structure containing PebBaseAddress; ProcessDebugPort (class 7) is also used for anti-debugging. The information class is not inferred here.",
-    ),
-    "RtlGetCurrentPeb": (
-        "WINAPI_PEB_ACCESS",
-        "Returns the current process's PEB pointer when this ntdll export is available; strongest API-level PEB indicator in this list.",
-    ),
-    "RtlGetCurrentTeb": (
-        "WINAPI_TEB_ACCESS",
-        "Returns the current thread's TEB; the TEB contains a pointer to the PEB, but a PEB read is not proven by this call alone.",
-    ),
-    "NtCurrentTeb": (
-        "WINAPI_TEB_ACCESS",
-        "TEB accessor/intrinsic name. This can be a macro or compiler intrinsic rather than an imported function; inspect the surrounding code.",
-    ),
-    "NtSetInformationThread": (
-        "WINAPI_ANTI_DEBUG",
-        "Native thread-information API often associated with ThreadHideFromDebugger; the information class is not inferred here and the call alone does not prove a PEB read.",
-    ),
-    "ZwSetInformationThread": (
-        "WINAPI_ANTI_DEBUG",
-        "Native thread-information API often associated with ThreadHideFromDebugger; the information class is not inferred here and the call alone does not prove a PEB read.",
-    ),
-    "NtQuerySystemInformation": (
-        "WINAPI_DEBUG_QUERY",
-        "Native system-information query; can be used for kernel-debugger checks with certain information classes. The class is not inferred here.",
-    ),
-    "ZwQuerySystemInformation": (
-        "WINAPI_DEBUG_QUERY",
-        "Native system-information query; can be used for kernel-debugger checks with certain information classes. The class is not inferred here.",
-    ),
-    "RtlQueryProcessDebugInformation": (
-        "WINAPI_DEBUG_QUERY",
-        "RTL process/debug-information query; potentially debugger-related, but not itself proof of a direct PEB dereference.",
-    ),
-    "OutputDebugStringA": (
-        "WINAPI_DEBUG_RELATED",
-        "Sends a string to the debugger. It may participate in debugger-detection patterns, but is not a PEB read by itself.",
-    ),
-    "OutputDebugStringW": (
-        "WINAPI_DEBUG_RELATED",
-        "Sends a string to the debugger. It may participate in debugger-detection patterns, but is not a PEB read by itself.",
-    ),
-    "GetModuleHandleA": (
-        "WINAPI_LOADER",
-        "Module-loader API. The loader maintains module state associated with PEB.Ldr, but this call does not prove that the caller directly reads the PEB.",
-    ),
-    "GetModuleHandleW": (
-        "WINAPI_LOADER",
-        "Module-loader API. The loader maintains module state associated with PEB.Ldr, but this call does not prove that the caller directly reads the PEB.",
-    ),
-    "GetModuleHandleExA": (
-        "WINAPI_LOADER",
-        "Module-loader API. The loader maintains module state associated with PEB.Ldr, but this call does not prove that the caller directly reads the PEB.",
-    ),
-    "GetModuleHandleExW": (
-        "WINAPI_LOADER",
-        "Module-loader API. The loader maintains module state associated with PEB.Ldr, but this call does not prove that the caller directly reads the PEB.",
-    ),
-    "GetProcAddress": (
-        "WINAPI_API_RESOLUTION",
-        "Resolves an API by name/address. Can hide later API usage from import-based analysis; inspect nearby name strings and indirect calls.",
-    ),
-    "LdrGetProcedureAddress": (
-        "WINAPI_API_RESOLUTION",
-        "Native loader API resolver; may be used for dynamic API resolution, including anti-debug APIs.",
-    ),
-    "LdrGetDllHandle": (
-        "WINAPI_LOADER",
-        "Native loader/module lookup API; related to loader state, but not proof that the caller directly reads PEB.Ldr.",
-    ),
-    "LdrGetDllHandleEx": (
-        "WINAPI_LOADER",
-        "Native loader/module lookup API; related to loader state, but not proof that the caller directly reads PEB.Ldr.",
-    ),
-    "LdrEnumerateLoadedModules": (
-        "WINAPI_LOADER",
-        "Enumerates loaded modules through the native loader; related to loader state associated with PEB.Ldr.",
-    ),
-    "LdrLoadDll": (
-        "WINAPI_LOADER",
-        "Native loader API; related to loader state associated with PEB.Ldr, but the call itself is not a direct PEB read.",
-    ),
-    "LoadLibraryA": (
-        "WINAPI_LOADER",
-        "Module-loader API; indirect/low-confidence PEB indicator only.",
-    ),
-    "LoadLibraryW": (
-        "WINAPI_LOADER",
-        "Module-loader API; indirect/low-confidence PEB indicator only.",
-    ),
-    "LoadLibraryExA": (
-        "WINAPI_LOADER",
-        "Module-loader API; indirect/low-confidence PEB indicator only.",
-    ),
-    "LoadLibraryExW": (
-        "WINAPI_LOADER",
-        "Module-loader API; indirect/low-confidence PEB indicator only.",
-    ),
-    "GetCommandLineA": (
-        "WINAPI_PROCESS_PARAMETERS",
-        "Returns the process command line, whose backing process-parameter state is associated with the PEB. This is indirect evidence, not a raw PEB read.",
-    ),
-    "GetCommandLineW": (
-        "WINAPI_PROCESS_PARAMETERS",
-        "Returns the process command line, whose backing process-parameter state is associated with the PEB. This is indirect evidence, not a raw PEB read.",
-    ),
-}
-
-_API_RULES_LOWER = {name.lower(): (name, info[0], info[1]) for name, info in _API_RULES.items()}
-_API_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_@$?.!]*")
-
-
-def _normalize_api_token(token):
-    """Normalize IDA import/thunk spellings such as __imp_Foo, _Foo@8 and j_Foo."""
+def normalize_api(token):
+    """Normalize __imp_Foo, _Foo@8, j_Foo, KERNEL32_Foo, Dll!Foo to 'foo'."""
     value = (token or "").strip().split("!")[-1].lower()
     value = re.sub(r"@\d+$", "", value)
-    for prefix in ("__imp_", "_imp_", "imp_", "j_", "__cdecl_", "__stdcall_"):
+    for prefix in API_PREFIXES:
         if value.startswith(prefix):
             value = value[len(prefix):]
             break
     value = value.lstrip("_")
-    # Some IDBs qualify imported symbols with a DLL-like prefix, e.g. KERNEL32_Foo.
-    if value not in _API_RULES_LOWER:
-        for api_lower in _API_RULES_LOWER:
-            if value.endswith("_" + api_lower):
-                value = api_lower
-                break
+    if value not in API_LOOKUP:
+        for api in API_LOOKUP:
+            if value.endswith("_" + api):
+                return api
     return value
 
 
-def _api_matches_text(text):
-    matches = {}
-    for token in _API_TOKEN_RE.findall(text or ""):
-        normalized = _normalize_api_token(token)
-        rule = _API_RULES_LOWER.get(normalized)
-        if rule:
-            canonical, category, description = rule
-            matches[canonical] = (category, description)
-    return matches
+def api_matches(text):
+    """Return {canonical API name: category} for API names found in text."""
+    found = {}
+    for token in API_TOKEN_RE.findall(text or ""):
+        entry = API_LOOKUP.get(normalize_api(token))
+        if entry:
+            found[entry[0]] = entry[1]
+    return found
 
 
-def _scan_winapi_calls():
-    """Find direct WinAPI/NTAPI calls by disassembly text and named xrefs."""
-    # Text matching works for usual IDA spellings such as call cs:__imp_IsDebuggerPresent.
-    for seg_start in idautils.Segments():
-        seg_end = idc.get_segm_end(seg_start)
-        for ea in _instruction_addresses(seg_start, seg_end):
-            mnemonic = (idc.print_insn_mnem(ea) or "").lower().strip()
-            if mnemonic not in ("call", "jmp"):
-                continue
-            disasm = _disassembly(ea)
-            for api_name, (category, description) in _api_matches_text(disasm).items():
-                _add_result(
-                    ea,
-                    category,
-                    "API %s via %s" % (api_name, mnemonic.upper()),
-                )
+# ---------------------------------------------------------------------------
+#   Scan
+# ---------------------------------------------------------------------------
 
-    # Xrefs cover cases where import/function names are present in the IDB but omitted
-    # from the rendered instruction (for example calls through an import thunk).
-    for name_ea, name in idautils.Names():
-        api_matches = _api_matches_text(name)
-        if not api_matches:
+class Findings(object):
+    """Unique (ea, category, detail) records."""
+
+    def __init__(self):
+        self.items = set()
+
+    def add(self, ea, category, detail):
+        self.items.add((ea, category, detail))
+
+
+def scan_instructions(findings):
+    """One pass: direct PEB slot reads and API calls/jumps by disassembly text."""
+    for ea in iter_insns():
+        mnem, ops = get_instruction(ea)
+        if not mnem:
             continue
-        for api_name, (category, description) in api_matches.items():
-            try:
-                refs = idautils.XrefsTo(name_ea, 0)
-                for xref in refs:
-                    site = xref.frm
-                    if not _is_code(site):
-                        continue
-                    mnemonic = (idc.print_insn_mnem(site) or "").lower().strip()
-                    if mnemonic not in ("call", "jmp"):
-                        continue
-                    _add_result(
-                        site,
-                        category,
-                        "API %s referenced by named symbol %s"
-                        % (api_name, name),
-                    )
-            except Exception:
-                # Some name/xref combinations (e.g. malformed or partially loaded IDBs)
-                # are not queryable; text-based scanning above still works.
-                pass
+
+        for index, op in enumerate(ops):
+            slot = peb_slot(op)
+            mode = memory_access_mode(mnem, index) if slot else None
+            if mode is None:
+                continue
+            if index > 0 and is_peb_ptr_load(mnem, ops):
+                category = "PEB_PTR_LOAD"
+            else:
+                category = "PEB_SLOT_RMW" if mode == "R/W" else "PEB_SLOT_READ"
+            findings.add(ea, category, "operand %d=%s (%s:[0x%X], %s)" %
+                         (index, op, slot[0].upper(), slot[1], mode))
+
+        if mnem in ("call", "jmp"):
+            for api, category in api_matches(disasm(ea)).items():
+                findings.add(ea, category, "API %s" % api)
 
 
-def _scan_dynamic_api_name_strings():
-    """Find referenced string literals naming APIs, useful for GetProcAddress cases.
+def writes_first_operand(mnem):
+    return mnem not in NO_DEST_WRITE and not mnem.startswith(("j", "loop"))
 
-    A matching string is only a candidate: the script cannot establish from the string
-    alone that GetProcAddress/LdrGetProcedureAddress is actually invoked with it.
-    """
-    try:
-        strings = idautils.Strings()
-        strings.setup()
-    except Exception:
+
+def step(state, mnem, ops):
+    """Update the set of registers that may hold a PEB-derived value."""
+    if mnem == "call":
+        state.difference_update(CALL_CLOBBERED)
+        return
+    dest = reg_family(ops[0]) if ops else None
+    if not dest:
         return
 
-    for string_item in strings:
-        try:
-            string_ea = string_item.ea
-            value = str(string_item).strip().strip("\x00")
-        except Exception:
-            continue
-        matches = _api_matches_text(value)
-        if not matches:
-            continue
-        # Only report exact API-name strings (not incidental prose containing a name).
-        normalized_value = _normalize_api_token(value)
-        exact = _API_RULES_LOWER.get(normalized_value)
-        if not exact:
-            continue
-        api_name, category, description = exact
-        try:
-            refs = list(idautils.DataRefsTo(string_ea))
-        except Exception:
-            refs = []
-        if not refs:
-            continue
-        for ref_ea in refs:
-            if not _is_code(ref_ea):
+    if (is_peb_ptr_load(mnem, ops)
+            or (mnem in COPY_MNEMONICS and len(ops) > 1 and reg_family(ops[1]) in state)
+            or (mnem == "lea" and any(memory_registers(op) & state for op in ops[1:]))):
+        state.add(dest)
+    elif mnem.startswith("cmov"):
+        if len(ops) > 1 and reg_family(ops[1]) in state:
+            state.add(dest)     # may keep the old value, so no discard
+    elif writes_first_operand(mnem):
+        state.discard(dest)
+
+
+def analyze_function(func, findings):
+    """Forward may-analysis over the CFG; report accesses via tracked registers."""
+    blocks = list(ida_gdl.FlowChart(func))
+    decoded = {}
+    for block in blocks:
+        decoded[block.id] = [(ea,) + get_instruction(ea)
+                             for ea in iter_insns(block.start_ea, block.end_ea)]
+
+    # Without a direct PEB pointer load the tracked state stays empty.
+    if not any(is_peb_ptr_load(mnem, ops) for insns in decoded.values()
+               for _, mnem, ops in insns if mnem):
+        return
+
+    ids = {block.id for block in blocks}
+    preds = {block.id: [p.id for p in block.preds() if p.id in ids] for block in blocks}
+    in_state = {block.id: set() for block in blocks}
+    out_state = {block.id: set() for block in blocks}
+
+    changed = True
+    while changed:     # finite lattice (register families): reaches a fixed point
+        changed = False
+        for block in blocks:
+            incoming = set().union(*(out_state[p] for p in preds[block.id]))
+            state = set(incoming)
+            for _, mnem, ops in decoded[block.id]:
+                if mnem:
+                    step(state, mnem, ops)
+            if incoming != in_state[block.id] or state != out_state[block.id]:
+                in_state[block.id], out_state[block.id] = incoming, state
+                changed = True
+
+    for block in blocks:
+        state = set(in_state[block.id])
+        for ea, mnem, ops in decoded[block.id]:
+            if not mnem:
                 continue
-            _add_result(
-                ref_ea,
-                "WINAPI_API_STRING",
-                "Reference to string %r (candidate dynamic API name: %s); verify a nearby GetProcAddress/LdrGetProcedureAddress call."
-                % (value, api_name),
-            )
+            for index, op in enumerate(ops):
+                mode = memory_access_mode(mnem, index)
+                bases = memory_registers(op) & state if mode else None
+                if bases:
+                    category = "PEB_FIELD_READ" if mode == "R" else "PEB_FIELD_RMW"
+                    findings.add(ea, category, "operand %d=%s; PEB-derived=%s; mode=%s" %
+                                 (index, op, ",".join(sorted(bases)), mode))
+            step(state, mnem, ops)
 
-def _disassembly(ea):
+
+def scan_derived_accesses(findings):
+    for func_ea in idautils.Functions():
+        if ida_kernwin.user_cancelled():
+            raise ScanCancelled()
+        func = ida_funcs.get_func(func_ea)
+        if not func:
+            continue
+        try:
+            analyze_function(func, findings)
+        except ScanCancelled:
+            raise
+        except Exception as exc:
+            log("Cannot analyze 0x%X: %s" % (func_ea, exc))
+
+
+def scan_named_api_xrefs(findings):
+    """Calls/jumps to named imports and thunks (disassembly may omit the name)."""
+    for name_ea, name in idautils.Names():
+        for api, category in api_matches(name).items():
+            for xref in idautils.XrefsTo(name_ea, 0):
+                site = xref.frm
+                if is_code(site) and idc.print_insn_mnem(site).lower() in ("call", "jmp"):
+                    findings.add(site, category, "API %s" % api)
+
+
+def scan_api_strings(findings):
+    """Code references to strings that are exact API names (GetProcAddress cases)."""
+    for item in idautils.Strings():
+        value = str(item).strip().strip("\x00")
+        entry = API_LOOKUP.get(normalize_api(value))
+        if not entry:
+            continue
+        for ref in idautils.DataRefsTo(item.ea):
+            if is_code(ref):
+                findings.add(ref, "WINAPI_API_STRING",
+                             "string %r (candidate dynamic API name: %s); "
+                             "check for a nearby GetProcAddress call" % (value, entry[0]))
+
+
+def scan():
+    findings = Findings()
+    ida_kernwin.clr_cancelled()
+    ida_kernwin.show_wait_box("NODELAY\nSearching for PEB accesses and related APIs...")
     try:
-        return ida_lines.tag_remove(idc.generate_disasm_line(ea, 0) or "").strip()
-    except Exception:
-        return idc.GetDisasm(ea) or ""
+        scan_instructions(findings)
+        scan_derived_accesses(findings)
+        scan_named_api_xrefs(findings)
+        scan_api_strings(findings)
+    except ScanCancelled:
+        log("Scan cancelled, results are partial.")
+    finally:
+        ida_kernwin.hide_wait_box()
 
+    rows = []
+    for ea, category, detail in sorted(findings.items):
+        rows.append((ea, [category, func_name(ea), detail, disasm(ea)]))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+#   Chooser
+# ---------------------------------------------------------------------------
+
+class ResultChooser(ida_kernwin.Choose):
+    """Rows are (ea, [cells...]); the Address column is added automatically."""
+
+    def __init__(self, title, columns, rows):
+        cols = [["Address", 14 | ida_kernwin.Choose.CHCOL_EA]] + columns
+        super().__init__(title, cols, flags=ida_kernwin.Choose.CH_QFLT)
+        self.rows = rows
+
+    def OnGetSize(self):
+        return len(self.rows)
+
+    def OnGetLine(self, n):
+        ea, cells = self.rows[n]
+        return ["0x%X" % ea] + list(cells)
+
+    def OnGetEA(self, n):
+        return self.rows[n][0]
+
+
+def show_results(rows):
+    global _chooser
+    if not rows:
+        log("Nothing found.")
+        return
+    _chooser = ResultChooser(TITLE, COLUMNS, rows)
+    _chooser.Show()
+
+
+# ---------------------------------------------------------------------------
+#   Main
+# ---------------------------------------------------------------------------
 
 def main():
-    RESULTS.clear()
-    print("\n" + "=" * 92)
-    print("[PEB-Finder] IDA Pro 9.3 - scanning direct/derived PEB accesses and WinAPI/NTAPI usage")
-    _scan_direct_peb_slots()
-    _find_indirect_peb_accesses()
-    _scan_winapi_calls()
-    _scan_dynamic_api_name_strings()
-
-    if not RESULTS:
-        print("[PEB-Finder] No matching references found.")
-        print("=" * 92)
-        return
-
-    print("[PEB-Finder] Unique instruction addresses: %d" % len(RESULTS))
-    print("[PEB-Finder] Categories include direct PEB reads, WinAPI/NTAPI anti-debug and process queries, loader calls, and candidate dynamic API-name strings.")
-    print("-" * 92)
-
-    for ea in sorted(RESULTS):
-        func_name = idc.get_func_name(ea) or "<no function>"
-        categories = ", ".join(sorted({category for category, _ in RESULTS[ea]}))
-        print("%s  %-30s  %-28s  %s" % ("0x%X" % ea, categories, func_name, _disassembly(ea)))
-        for _, detail in RESULTS[ea]:
-            print("    - " + detail)
-
-    print("-" * 92)
-    print("[PEB-Finder] Done. The database was not modified.")
-    print("=" * 92 + "\n")
+    rows = scan()
+    log("Findings: %d at %d address(es)." %
+        (len(rows), len({ea for ea, _ in rows})))
+    show_results(rows)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,8 @@
-"""
-IDA Pro 9.3 / IDAPython: find potential timing measurement sites.
+"""Timing Finder for IDA Pro 9.3 (IDAPython).
 
-Searches for:
-  * RDTSC instructions (and RDTSCP optionally);
-  * references to imported/named GetTickCount and GetTickCount64 APIs;
-  * direct API calls and calls through simple import-thunk functions;
-  * nearby pairs of RDTSC/API calls within the same function.
-
-Run via File -> Script file... and select this .py file.
-The database is not modified by default. Comments can be enabled in the settings below.
+Finds RDTSC/RDTSCP, calls to timing APIs (directly or via import thunks)
+and nearby pairs of such sites within one function (a heuristic).
+Usage: File -> Script file...
 """
 
 import re
@@ -23,275 +17,272 @@ import idautils
 import idc
 
 
-# ----------------------------- Settings -------------------------------------
+# ---------------------------------------------------------------------------
+#   Configuration
+# ---------------------------------------------------------------------------
+
+TITLE = "Timing Finder"
+LOG_TAG = "[Timing]"
 
 SEARCH_RDTSCP = True
-ANNOTATE_COMMENTS = False
-# Maximum byte distance between two candidates for them to be reported as a
-# possible measurement pair. This is a heuristic, not proof of a relationship.
-MAX_PAIR_DISTANCE = 0x1000
+ADD_COMMENTS = False            # True = annotate found sites in the database
+MAX_PAIR_DISTANCE = 0x1000      # max distance (bytes) for a "pair" of sites
+TIMING_APIS = ("GetTickCount", "GetTickCount64")   # extend as needed
 
-# Also match decorated names such as __imp_GetTickCount and _GetTickCount@0.
-API_NAME_RE = re.compile(r"gettickcount(?:64)?(?:@\d+)?$", re.IGNORECASE)
+# Also matches decorated names: __imp_X, j_X, _X@0, KERNEL32_X.
+API_NAME_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:%s)(?:@\d+)?$" % "|".join(map(re.escape, TIMING_APIS)),
+    re.IGNORECASE,
+)
 CALL_MNEMONICS = {"call", "callq", "bl", "blx", "blr", "jal", "jalr", "lcall"}
 JUMP_MNEMONICS = {"jmp", "jmpq", "b", "br", "bx"}
-COMMENT_MARKER = "[TimingFinder]"
+COMMENT_MARKER = LOG_TAG
+
+COLUMNS = [
+    ["Kind", 14],
+    ["Function", 28],
+    ["Detail", 40],
+    ["Disassembly", 44],
+]
+
+_chooser = None  # keep a reference while the window is open
 
 
-def log(message=""):
-    """Write a message to IDA's Output window."""
-    ida_kernwin.msg(str(message) + "\n")
+# ---------------------------------------------------------------------------
+#   Helpers
+# ---------------------------------------------------------------------------
+
+class ScanCancelled(Exception):
+    pass
 
 
-def is_timing_api_name(name):
-    if not name:
-        return False
-    return API_NAME_RE.search(str(name)) is not None
+def log(message):
+    ida_kernwin.msg("%s %s\n" % (LOG_TAG, message))
 
 
-def is_code(ea):
-    if ea is None or ea == idc.BADADDR:
-        return False
-    try:
-        return ida_bytes.is_code(ida_bytes.get_full_flags(ea))
-    except Exception:
-        return False
+def disasm(ea):
+    line = idc.generate_disasm_line(ea, 0) or ""
+    return ida_lines.tag_remove(line).strip()
+
+
+def func_name(ea):
+    return idc.get_func_name(ea) or "<no function>"
+
+
+def func_start(ea):
+    func = ida_funcs.get_func(ea)
+    return func.start_ea if func else None
 
 
 def mnemonic(ea):
     return (idc.print_insn_mnem(ea) or "").lower()
 
 
-def disasm(ea):
-    try:
-        line = idc.generate_disasm_line(ea, 0)
-        if line:
-            return ida_lines.tag_remove(line)
-    except Exception:
-        pass
-    return mnemonic(ea)
+def is_code(ea):
+    return ea != idc.BADADDR and ida_bytes.is_code(ida_bytes.get_flags(ea))
 
 
-def get_function_info(ea):
-    """Return (start_ea, display_name), or (None, '<outside function>')."""
-    func = ida_funcs.get_func(ea)
-    if not func:
-        return None, "<outside function>"
+def is_call(mnem):
+    return mnem in CALL_MNEMONICS or mnem.startswith("call")
 
-    start = func.start_ea
-    name = idc.get_name(start) or ("sub_%X" % start)
-    return start, "%s @ 0x%X" % (name, start)
+
+def is_jump(mnem):
+    return mnem in JUMP_MNEMONICS or mnem.startswith("jmp")
+
+
+def iter_insns():
+    """Yield code heads of executable segments; raise ScanCancelled on Cancel."""
+    count = 0
+    for seg_ea in idautils.Segments():
+        seg = ida_segment.getseg(seg_ea)
+        if seg is None:
+            continue
+        executable = (seg.perm & ida_segment.SEGPERM_EXEC) or seg.type == ida_segment.SEG_CODE
+        if not executable:
+            continue
+        for ea in idautils.Heads(seg.start_ea, seg.end_ea):
+            count += 1
+            if count % 4096 == 0 and ida_kernwin.user_cancelled():
+                raise ScanCancelled()
+            if ida_bytes.is_code(ida_bytes.get_flags(ea)):
+                yield ea
 
 
 def add_comment(ea, text):
-    """Add a comment without duplicating this script's own marker."""
-    if not ANNOTATE_COMMENTS:
+    if not ADD_COMMENTS:
         return
     old = idc.get_cmt(ea, False) or ""
     if COMMENT_MARKER in old and text in old:
         return
-    new_text = (old + " | " if old else "") + COMMENT_MARKER + " " + text
-    idc.set_cmt(ea, new_text, False)
+    idc.set_cmt(ea, (old + " | " if old else "") + COMMENT_MARKER + " " + text, False)
 
 
-def collect_timing_api_targets():
-    """Collect import addresses and names resembling the GetTickCount API."""
-    targets = {}  # ea -> set(label)
+# ---------------------------------------------------------------------------
+#   Scan
+# ---------------------------------------------------------------------------
 
-    def add_target(ea, label):
-        if ea is None or ea == idc.BADADDR:
-            return
-        targets.setdefault(ea, set()).add(str(label))
+def scan_rdtsc():
+    """Return {ea: MNEMONIC} for RDTSC/RDTSCP instructions."""
+    wanted = {"rdtsc", "rdtscp"} if SEARCH_RDTSCP else {"rdtsc"}
+    found = {}
+    for ea in iter_insns():
+        mnem = mnemonic(ea)
+        if mnem in wanted:
+            found[ea] = mnem.upper()
+            add_comment(ea, "%s: possible cycle-counter measurement" % mnem.upper())
+    return found
 
-    # First, collect names, including names assigned to IDA thunk functions.
+
+def collect_api_targets():
+    """Return {ea: {labels}} for named/imported timing APIs."""
+    targets = {}
+
+    def add(ea, label):
+        if ea != idc.BADADDR:
+            targets.setdefault(ea, set()).add(label)
+
     for ea, name in idautils.Names():
-        if is_timing_api_name(name):
-            add_target(ea, name)
+        if API_NAME_RE.search(name or ""):
+            add(ea, name)
 
-    # Next, scan the import table: not all imported functions are necessarily
-    # represented in Names() in the same way.
-    try:
-        module_count = ida_nalt.get_import_module_qty()
-    except Exception as exc:
-        log("[!] Failed to retrieve the import list: %s" % exc)
-        module_count = 0
+    for index in range(ida_nalt.get_import_module_qty()):
+        dll = ida_nalt.get_import_module_name(index) or "<unknown DLL>"
 
-    for module_index in range(module_count):
-        module_name = ida_nalt.get_import_module_name(module_index) or "<unknown DLL>"
+        def callback(ea, name, ordinal, dll=dll):
+            if API_NAME_RE.search(name or ""):
+                add(ea, "%s!%s" % (dll, name))
+            return True
 
-        def import_callback(ea, name, ordinal, dll=module_name):
-            if is_timing_api_name(name):
-                label = "%s!%s" % (dll, name)
-                add_target(ea, label)
-            return True  # Continue enumerating imports.
-
-        try:
-            ida_nalt.enum_import_names(module_index, import_callback)
-        except Exception as exc:
-            log("[!] Error reading imports from %s: %s" % (module_name, exc))
+        ida_nalt.enum_import_names(index, callback)
 
     return targets
 
 
-def scan_rdtsc():
-    """Scan instructions in executable segments."""
-    wanted = {"rdtsc"}
-    if SEARCH_RDTSCP:
-        wanted.add("rdtscp")
+def scan_api_refs(targets):
+    """Return ({call ea: labels}, {other ref ea: labels}, thunk count)."""
+    calls, refs, thunks = {}, {}, {}
 
-    found = []
-    for seg_start in idautils.Segments():
-        seg = ida_segment.getseg(seg_start)
-        if not seg:
-            continue
-        if not (seg.perm & ida_segment.SEGPERM_EXEC):
-            continue
-
-        for ea in idautils.Heads(seg.start_ea, seg.end_ea):
-            if not is_code(ea):
-                continue
-            mnem = mnemonic(ea)
-            if mnem in wanted:
-                func_start, func_name = get_function_info(ea)
-                found.append({
-                    "ea": ea,
-                    "mnem": mnem.upper(),
-                    "func_start": func_start,
-                    "func_name": func_name,
-                    "disasm": disasm(ea),
-                })
-                add_comment(ea, "%s: possible cycle-counter measurement" % mnem.upper())
-
-    return sorted(found, key=lambda item: item["ea"])
-
-
-def is_call_mnemonic(mnem):
-    return mnem in CALL_MNEMONICS or mnem.startswith("call")
-
-
-def is_jump_mnemonic(mnem):
-    return mnem in JUMP_MNEMONICS or mnem.startswith("jmp")
-
-
-def scan_api_references(targets):
-    """Return (calls, other references, discovered import-thunk functions)."""
-    calls = {}       # source EA -> set(API labels)
-    references = {}  # source EA -> set(API labels)
-    possible_thunks = {}  # thunk start EA -> set(API labels)
-
-    def add_event(table, ea, label):
-        table.setdefault(ea, set()).add(label)
-
-    for target_ea, labels in targets.items():
-        for xref in idautils.XrefsTo(target_ea, 0):
+    for target, labels in targets.items():
+        for xref in idautils.XrefsTo(target, 0):
             src = xref.frm
             if not is_code(src):
                 continue
-
             mnem = mnemonic(src)
             func = ida_funcs.get_func(src)
             for label in labels:
-                if is_call_mnemonic(mnem):
-                    add_event(calls, src, label)
+                if is_call(mnem):
+                    calls.setdefault(src, set()).add(label)
                     add_comment(src, "call to %s" % label)
                 else:
-                    add_event(references, src, label)
+                    refs.setdefault(src, set()).add(label)
                     add_comment(src, "reference to %s" % label)
+                # An import thunk is a function that starts with a JMP to the API.
+                if func and func.start_ea == src and is_jump(mnem):
+                    thunks.setdefault(src, set()).add(label)
 
-                # A simple import thunk usually starts with a JMP to the IAT/API.
-                # Only check a JMP at the beginning of an IDA function, so an
-                # arbitrary jump inside a regular function is not treated as a thunk.
-                if (func and func.start_ea == src and is_jump_mnemonic(mnem)):
-                    possible_thunks.setdefault(func.start_ea, set()).add(label)
-
-    # If a JMP thunk was found, look one level up for CALL instructions to it.
-    for thunk_ea, labels in possible_thunks.items():
-        thunk_name = idc.get_name(thunk_ea) or ("thunk_%X" % thunk_ea)
-        for xref in idautils.XrefsTo(thunk_ea, 0):
+    # One level up: calls to the thunks.
+    for thunk, labels in thunks.items():
+        thunk_name = idc.get_name(thunk) or ("thunk_%X" % thunk)
+        for xref in idautils.XrefsTo(thunk, 0):
             src = xref.frm
-            if not is_code(src) or not is_call_mnemonic(mnemonic(src)):
-                continue
-            for label in labels:
-                add_event(calls, src, "%s via %s" % (label, thunk_name))
-                add_comment(src, "call to %s via thunk %s" % (label, thunk_name))
+            if is_code(src) and is_call(mnemonic(src)):
+                for label in labels:
+                    calls.setdefault(src, set()).add("%s via %s" % (label, thunk_name))
+                    add_comment(src, "call to %s via thunk %s" % (label, thunk_name))
 
-    return calls, references, possible_thunks
+    return calls, refs, len(thunks)
 
 
-def find_nearby_pairs(addresses):
-    """Find adjacent addresses in the same function within the configured window."""
-    by_function = {}
+def find_pairs(addresses):
+    """Return [(left, right, distance)] for neighbours within one function."""
+    by_func = {}
     for ea in sorted(addresses):
-        func_start, _ = get_function_info(ea)
-        if func_start is not None:
-            by_function.setdefault(func_start, []).append(ea)
+        start = func_start(ea)
+        if start is not None:
+            by_func.setdefault(start, []).append(ea)
 
     pairs = []
-    for func_start, eas in by_function.items():
-        eas.sort()
+    for eas in by_func.values():
         for left, right in zip(eas, eas[1:]):
-            distance = right - left
-            if distance <= MAX_PAIR_DISTANCE:
-                pairs.append((left, right, func_start, distance))
-
-    return sorted(pairs, key=lambda item: (item[2], item[0], item[1]))
+            if right - left <= MAX_PAIR_DISTANCE:
+                pairs.append((left, right, right - left))
+    return sorted(pairs)
 
 
-def print_sites(title, events, labels_for_address=None):
-    log("\n%s (%d):" % (title, len(events)))
-    if not events:
-        log("  none found")
+def make_row(ea, kind, detail):
+    return (ea, [kind, func_name(ea), detail, disasm(ea)])
+
+
+def scan():
+    rows = []
+    stats = {"targets": 0, "thunks": 0}
+
+    ida_kernwin.clr_cancelled()
+    ida_kernwin.show_wait_box("NODELAY\nSearching for timing measurement sites...")
+    try:
+        rdtsc = scan_rdtsc()
+        targets = collect_api_targets()
+        calls, refs, thunk_count = scan_api_refs(targets)
+        stats.update(targets=len(targets), thunks=thunk_count)
+
+        rows += [make_row(ea, "RDTSC", m) for ea, m in rdtsc.items()]
+        rows += [make_row(ea, "API call", ", ".join(sorted(l))) for ea, l in calls.items()]
+        rows += [make_row(ea, "API ref", ", ".join(sorted(l))) for ea, l in refs.items()]
+
+        for kind, eas in (("Pair (RDTSC)", rdtsc), ("Pair (API)", calls)):
+            for left, right, dist in find_pairs(eas):
+                rows.append(make_row(left, kind, "-> 0x%X (distance 0x%X)" % (right, dist)))
+    except ScanCancelled:
+        log("Scan cancelled, results are partial.")
+    finally:
+        ida_kernwin.hide_wait_box()
+
+    rows.sort(key=lambda row: (row[0], row[1][0]))
+    return rows, stats
+
+
+# ---------------------------------------------------------------------------
+#   Chooser
+# ---------------------------------------------------------------------------
+
+class ResultChooser(ida_kernwin.Choose):
+    """Rows are (ea, [cells...]); the Address column is added automatically."""
+
+    def __init__(self, title, columns, rows):
+        cols = [["Address", 14 | ida_kernwin.Choose.CHCOL_EA]] + columns
+        super().__init__(title, cols, flags=ida_kernwin.Choose.CH_QFLT)
+        self.rows = rows
+
+    def OnGetSize(self):
+        return len(self.rows)
+
+    def OnGetLine(self, n):
+        ea, cells = self.rows[n]
+        return ["0x%X" % ea] + list(cells)
+
+    def OnGetEA(self, n):
+        return self.rows[n][0]
+
+
+def show_results(rows):
+    global _chooser
+    if not rows:
+        log("Nothing found.")
         return
-
-    for item in events:
-        ea = item["ea"] if isinstance(item, dict) else item
-        func_start, func_name = get_function_info(ea)
-        label_text = ""
-        if labels_for_address is not None:
-            label_text = " | " + ", ".join(sorted(labels_for_address.get(ea, set())))
-        log("  0x%X  [%s]%s" % (ea, func_name, label_text))
-        if isinstance(item, dict) and item.get("disasm"):
-            log("      %s" % item["disasm"])
-        elif is_code(ea):
-            log("      %s" % disasm(ea))
+    _chooser = ResultChooser(TITLE, COLUMNS, rows)
+    _chooser.Show()
 
 
-def print_pairs(title, pairs):
-    log("\n%s (%d):" % (title, len(pairs)))
-    if not pairs:
-        log("  none found")
-        return
-    for left, right, func_start, distance in pairs:
-        func_name = idc.get_name(func_start) or ("sub_%X" % func_start)
-        log("  0x%X -> 0x%X  (%s, distance 0x%X bytes)" %
-            (left, right, func_name, distance))
-
+# ---------------------------------------------------------------------------
+#   Main
+# ---------------------------------------------------------------------------
 
 def main():
-    log("=" * 72)
-    log("TimingFinder for IDA Pro 9.3")
-    log("Searching for RDTSC/RDTSCP and GetTickCount/GetTickCount64")
-    log("Heuristic pair distance threshold: 0x%X bytes" % MAX_PAIR_DISTANCE)
-    log("Database comments: %s" % ("enabled" if ANNOTATE_COMMENTS else "disabled"))
-
-    rdtsc_sites = scan_rdtsc()
-    api_targets = collect_timing_api_targets()
-    api_calls, api_references, thunks = scan_api_references(api_targets)
-
-    print_sites("RDTSC/RDTSCP instructions", rdtsc_sites)
-    print_sites("GetTickCount/GetTickCount64 calls", sorted(api_calls), api_calls)
-    print_sites("Other code references to the API (not necessarily calls)",
-                sorted(api_references), api_references)
-
-    rdtsc_pairs = find_nearby_pairs([item["ea"] for item in rdtsc_sites])
-    api_pairs = find_nearby_pairs(sorted(api_calls))
-    print_pairs("Possible RDTSC/RDTSCP pairs in the same function", rdtsc_pairs)
-    print_pairs("Possible GetTickCount* call pairs in the same function", api_pairs)
-
-    log("\nSummary: RDTSC/RDTSCP=%d, API targets=%d, API calls=%d, API refs=%d, thunk candidates=%d" %
-        (len(rdtsc_sites), len(api_targets), len(api_calls), len(api_references), len(thunks)))
-    log("Note: address proximity is only a heuristic; verify control flow and how the result is used.")
-    log("=" * 72)
+    rows, stats = scan()
+    log("Rows: %d | API targets: %d | thunk candidates: %d" %
+        (len(rows), stats["targets"], stats["thunks"]))
+    log("Pairs are only a proximity heuristic; verify the control flow.")
+    show_results(rows)
 
 
 if __name__ == "__main__":

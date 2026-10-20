@@ -1,18 +1,10 @@
 """XOR Primitive Finder for IDA Pro 9.3 (IDAPython).
 
-    | Decodes instructions, detects instructions from XOR family,
-    | and ranks functions by XOR-based encoding likelihood.
-
-self-XOR zeroing forms are detected from decoded register operands and are
-excluded from the heuristic score for XOR-based encoding. Examples:
-    x86:      xor eax, eax
-    AArch64:  eor x0, x1, x1
-    AVX:      vpxor xmm0, xmm1, xmm1
-
-USAGE: File -> Script file...
-
-double-click a result row to jump to the first non-zeroing XOR (or the first
-self-XOR if the function only contains zeroing XOR instructions).
+Decodes instructions, finds XOR-family instructions and ranks functions by how
+likely they are to contain XOR-based encoding. Zeroing forms (xor eax, eax;
+eor x0, x1, x1; vpxor xmm0, xmm1, xmm1) are detected from decoded register
+operands and excluded from the score.
+Usage: File -> Script file...
 """
 
 import collections
@@ -29,460 +21,305 @@ import idc
 #   Configuration
 # ---------------------------------------------------------------------------
 
-WINDOW_TITLE = "XOR Primitive Finder"
+TITLE = "XOR Primitive Finder"
+LOG_TAG = "[XOR Prims]"
 
-# These are names in the *current processor module's instruction table*, not
-# text parsed from disassembly output. They are converted to itype sets once.
-XOR_TYPE_PREFIXES = (
-    "xor", "pxor", "vpxor", "eor", "veor", "pdp_xor",
-)
-
-MIX_TYPE_PREFIXES = (
-    "add", "sub", "adc", "sbb", "mul", "imul", "madd", "msub",
-    "rol", "ror", "shl", "shr", "sar", "sal", "shld", "shrd",
-    "lsl", "lsr", "asr", "rrx", "and", "or", "orr", "bic", "not",
-    "mvn", "neg", "rsb", "bswap", "rev", "rbit",
-)
-
-SHIFT_ROTATE_TYPE_PREFIXES = (
+# Prefixes of instruction names in the current processor module's table.
+XOR_PREFIXES = ("xor", "pxor", "vpxor", "vxor", "eor", "veor")
+SHIFT_ROTATE_PREFIXES = (
     "rol", "ror", "shl", "shr", "sar", "sal", "shld", "shrd",
     "lsl", "lsr", "asr", "rrx",
 )
-
-# Branch types are also sourced from the processor's instruction table. The
-# exact list catches common ISAs while avoiding broad "b*" matches such as BIC.
-BRANCH_TYPE_EXACT = {
-    "b", "ba", "bal", "bc", "bcc", "bcs", "beq", "bne", "bgt",
-    "bge", "blt", "ble", "bhi", "bls", "bvs", "bvc", "bmi", "bpl",
-    "bhs", "blo", "br", "bra", "brw", "bl", "blx", "bx", "bxj",
-    "jmp", "ljmp", "jmpq", "call", "callq",
+MIX_PREFIXES = SHIFT_ROTATE_PREFIXES + (
+    "add", "sub", "adc", "sbb", "mul", "imul", "madd", "msub",
+    "and", "or", "orr", "bic", "not", "mvn", "neg", "rsb", "bswap", "rev", "rbit",
+)
+# Exact names avoid broad "b*" matches such as BIC.
+BRANCH_EXACT = {
+    "b", "ba", "bal", "bc", "bcc", "bcs", "beq", "bne", "bgt", "bge", "blt",
+    "ble", "bhi", "bls", "bvs", "bvc", "bmi", "bpl", "bhs", "blo", "br", "bra",
+    "brw", "bl", "blx", "bx", "bxj", "jmp", "ljmp", "jmpq", "call", "callq",
 }
+BRANCH_PREFIXES = ("j", "loop", "cbz", "cbnz", "tbz", "tbnz")
 
-BRANCH_TYPE_PREFIXES = ("j", "loop", "cbz", "cbnz", "tbz", "tbnz")
+MAX_OPERANDS = getattr(ida_ua, "UA_MAXOP", 8)
 
-# Populated from ida_idp.ph_get_instruc(); keys are decoded insn_t.itype values.
-INSTRUCTION_NAMES = {}
-XOR_ITYPES = set()
-MIX_ITYPES = set()
-SHIFT_ROTATE_ITYPES = set()
-BRANCH_ITYPES = set()
+COLUMNS = [
+    ["Function", 28],
+    ["XORs", 6 | ida_kernwin.Choose.CHCOL_DEC],
+    ["Useful", 7 | ida_kernwin.Choose.CHCOL_DEC],
+    ["Zeroing", 8 | ida_kernwin.Choose.CHCOL_DEC],
+    ["Loops", 6 | ida_kernwin.Choose.CHCOL_DEC],
+    ["Score", 6 | ida_kernwin.Choose.CHCOL_DEC],
+    ["Rating", 8],
+    ["Sample", 40],
+]
+
+Itypes = collections.namedtuple("Itypes", "names xor mix rotate branch")
+ITYPES = None        # filled by build_itypes()
+_chooser = None      # keep a reference while the window is open
 
 
 # ---------------------------------------------------------------------------
-#   Instruction type discovery / decoding
+#   Helpers
 # ---------------------------------------------------------------------------
 
-def _normalise_type_name(name):
-    """Normalise a processor-table instruction identifier."""
-    return str(name or "").lower().replace(" ", "")
+def log(message):
+    ida_kernwin.msg("%s %s\n" % (LOG_TAG, message))
 
 
-def _build_instruction_type_sets():
-    """Build architecture-specific itype sets from the active IDP module.
+def disasm(ea):
+    line = idc.generate_disasm_line(ea, 0) or ""
+    return ida_lines.tag_remove(line).strip()
 
-    IDA's instruction codes are processor-module-specific. ph_get_instruc_start()
-    gives the first code and ph_get_instruc() returns its (name, feature) table.
-    For each table entry, its itype is start + entry_index.
+
+def func_name(ea):
+    return idc.get_func_name(ea) or ("sub_%X" % ea)
+
+
+def build_itypes():
+    """Map the active processor module's instruction table to itype sets.
+
+    itype codes are processor-specific: entry i of ph_get_instruc() has the
+    code ph_get_instruc_start() + i.
     """
-    global INSTRUCTION_NAMES, XOR_ITYPES, MIX_ITYPES
-    global SHIFT_ROTATE_ITYPES, BRANCH_ITYPES
-
     try:
-        first_itype = int(ida_idp.ph_get_instruc_start())
-        last_itype = int(ida_idp.ph_get_instruc_end())
-        instruction_table = ida_idp.ph_get_instruc()
+        first = int(ida_idp.ph_get_instruc_start())
+        last = int(ida_idp.ph_get_instruc_end())
+        table = ida_idp.ph_get_instruc()
     except Exception as exc:
-        raise RuntimeError(
-            "Cannot read the active processor instruction table via ida_idp: %s" % exc
-        )
+        raise RuntimeError("cannot read the processor instruction table: %s" % exc)
+    if not table:
+        raise RuntimeError("the processor instruction table is empty")
 
-    if not instruction_table:
-        raise RuntimeError("The active processor instruction table is empty")
-
-    # In the SDK, instruc_end is the end of the processor's instruction-code
-    # range. Be tolerant of modules whose exposed table/range length differs.
-    range_size = max(0, last_itype - first_itype)
-    usable_count = min(len(instruction_table), range_size or len(instruction_table))
-
+    count = min(len(table), (last - first) or len(table))
     names = {}
-    for index in range(usable_count):
-        entry = instruction_table[index]
-        try:
-            type_name = _normalise_type_name(entry[0])
-        except Exception:
-            continue
-        if type_name:
-            names[first_itype + index] = type_name
-
+    for index in range(count):
+        name = str(table[index][0] or "").lower().replace(" ", "")
+        if name:
+            names[first + index] = name
     if not names:
-        raise RuntimeError("Could not map processor instruction types to names")
+        raise RuntimeError("cannot map instruction types to names")
 
-    def types_with_prefixes(prefixes, exact=()):
-        exact = set(exact)
-        result = set()
-        for itype, type_name in names.items():
-            if type_name in exact or type_name.startswith(prefixes):
-                result.add(itype)
+    def select(prefixes, exact=()):
+        return {itype for itype, name in names.items()
+                if name in exact or name.startswith(prefixes)}
 
-        return result
-
-    INSTRUCTION_NAMES = names
-    XOR_ITYPES = types_with_prefixes(XOR_TYPE_PREFIXES)
-    MIX_ITYPES = types_with_prefixes(MIX_TYPE_PREFIXES)
-    SHIFT_ROTATE_ITYPES = types_with_prefixes(SHIFT_ROTATE_TYPE_PREFIXES)
-    BRANCH_ITYPES = types_with_prefixes(BRANCH_TYPE_PREFIXES, BRANCH_TYPE_EXACT)
-
-    if not XOR_ITYPES:
-        proc_name = "unknown"
-        try:
-            proc_name = str(ida_idp.ph_get_id())
-        except Exception:
-            pass
-        raise RuntimeError(
-            "No XOR-like instruction types identified for processor '%s'. "
-            "Its table may use different instruction names." % proc_name
-        )
+    itypes = Itypes(
+        names=names,
+        xor=select(XOR_PREFIXES),
+        mix=select(MIX_PREFIXES),
+        rotate=select(SHIFT_ROTATE_PREFIXES),
+        branch=select(BRANCH_PREFIXES, BRANCH_EXACT),
+    )
+    if not itypes.xor:
+        raise RuntimeError("no XOR-like instructions in this processor's table")
+    return itypes
 
 
-def _decode_instruction(ea):
-    """Decode ea without changing the database; return insn_t or None."""
+def decode(ea):
+    """Decode the instruction at ea without touching the database."""
     insn = ida_ua.insn_t()
     try:
-        size = ida_ua.decode_insn(insn, ea)
+        return insn if ida_ua.decode_insn(insn, ea) > 0 else None
     except Exception:
         return None
 
-    return insn if size > 0 else None
 
-
-def _instruction_type_name(insn):
-    """Return the processor table label (Debug)."""
-    return INSTRUCTION_NAMES.get(int(insn.itype), "itype_%d" % int(insn.itype))
-
-
-def _explicit_operands(insn):
-    """Return decoded operands up to the first o_void operand."""
-    result = []
-    for index in range(8):  # insn_t contains eight operand slots in IDA 9.x
-        try:
-            op = insn.ops[index]
-        except Exception:
-            break
+def explicit_operands(insn):
+    ops = []
+    for index in range(MAX_OPERANDS):
+        op = insn.ops[index]
         if op.type == ida_ua.o_void:
             break
-        result.append(op)
-
-    return result
-
-
-def _operand_register(op):
-    """Return the numeric register ID for an o_reg operand, else None."""
-    if op is not None and op.type == ida_ua.o_reg:
-        return int(op.reg)
-
-    return None
+        ops.append(op)
+    return ops
 
 
-def _is_self_xor(insn):
-    """Detect register self-XOR / XOR-with-identical-sources zeroing forms.
+def register_of(op):
+    return int(op.reg) if op.type == ida_ua.o_reg else None
 
-    Two operands: dst ^= src, so dst == src clears the destination.
-    Three operands: dst = src1 XOR src2, so src1 == src2 clears the destination.
-    Only decoded register operands are considered; printed operand strings are
-    deliberately not used for this test.
-    """
-    ops = _explicit_operands(insn)
 
+def is_zeroing_xor(insn):
+    """dst ^= src with dst == src, or dst = src1 ^ src2 with src1 == src2."""
+    ops = explicit_operands(insn)
     if len(ops) == 2:
-        dst = _operand_register(ops[0])
-        src = _operand_register(ops[1])
-        return dst is not None and src is not None and dst == src
-
-    if len(ops) == 3:
-        src1 = _operand_register(ops[1])
-        src2 = _operand_register(ops[2])
-        return src1 is not None and src2 is not None and src1 == src2
-
-    # Do not guess for unusual instruction forms (e.g. four-input EOR3).
-    return False
+        regs = register_of(ops[0]), register_of(ops[1])
+    elif len(ops) == 3:
+        regs = register_of(ops[1]), register_of(ops[2])
+    else:
+        return False    # do not guess for unusual forms
+    return regs[0] is not None and regs[0] == regs[1]
 
 
-def _is_backward_branch(ea, insn, func_start):
-    """Detect a direct, typed branch to an earlier address in this function."""
-    if int(insn.itype) not in BRANCH_ITYPES:
+def is_backward_branch(ea, insn, func_start):
+    """Direct branch to an earlier address of the same function (a loop edge)."""
+    if int(insn.itype) not in ITYPES.branch:
         return False
-
-    ops = _explicit_operands(insn)
-    if not ops:
+    ops = explicit_operands(insn)
+    if not ops or ops[0].type not in (ida_ua.o_near, ida_ua.o_far):
         return False
-
-    direct_types = set()
-    for attr in ("o_near", "o_far"):
-        if hasattr(ida_ua, attr):
-            direct_types.add(getattr(ida_ua, attr))
-    if not direct_types or ops[0].type not in direct_types:
-        return False
-
-    try:
-        target = int(ops[0].addr)
-    except Exception:
-        return False
-
-    return func_start <= target < ea
-
-
-def _disasm(ea):
-    """Format an instruction for UI display."""
-    try:
-        line = idc.generate_disasm_line(ea, 0)
-        if line:
-            return ida_lines.tag_remove(line).strip()
-    except Exception:
-        pass
-
-    return "instruction at 0x%X" % ea
-
-
-def _function_name(func_ea):
-    try:
-        return idc.get_func_name(func_ea) or ("sub_%X" % func_ea)
-    except Exception:
-        return "sub_%X" % func_ea
+    return func_start <= int(ops[0].addr) < ea
 
 
 # ---------------------------------------------------------------------------
 #   Scoring
 # ---------------------------------------------------------------------------
 
-def _score_function(useful_count, mix_count, rotate_count,
-                    back_edges, useful_dst_registers, insn_count):
-    """Return heuristic score for a function"""
-    # A function containing only zeroing XORs should not score as an XOR-based
-    # encoding candidate, regardless of how many unrelated shifts/loops it has.
-    if useful_count <= 0:
-        return 0
+def score_function(useful, mix, rotate, back_edges, dst_registers, insn_count):
+    if useful <= 0:
+        return 0    # zeroing-only functions are never candidates
 
-    if useful_count == 1:
-        score = 1
-    elif useful_count == 2:
-        score = 2
-    elif useful_count <= 4:
-        score = 3
-    elif useful_count <= 7:
-        score = 4
-    else:
-        score = 5
+    score = 1 if useful == 1 else 2 if useful == 2 else 3 if useful <= 4 else 4 if useful <= 7 else 5
+    score += (mix >= 4) * 2 + (mix >= 8)
+    score += (back_edges >= 1) * 2 + (back_edges >= 3)
+    score += rotate >= 2
 
-    if mix_count >= 4:
-        score += 2
-    if mix_count >= 8:
-        score += 1
-
-    if back_edges:
-        score += 2
-    if back_edges >= 3:
-        score += 1
-
-    if rotate_count >= 2:
-        score += 1
-
-    # Reusing a destination register across non-zeroing XOR instructions is a
-    # weak accumulator/round-function hint.
-    dst_counts = collections.Counter(useful_dst_registers)
-    if dst_counts and max(dst_counts.values()) >= 2:
-        score += 1
-
-    if insn_count and useful_count >= 3 and (useful_count / float(insn_count)) >= 0.08:
-        score += 1
-
-    return score
+    # The same destination reused by several XORs hints at an accumulator.
+    counts = collections.Counter(dst_registers)
+    score += bool(counts) and max(counts.values()) >= 2
+    score += bool(insn_count) and useful >= 3 and useful / float(insn_count) >= 0.08
+    return int(score)
 
 
-def _rating(score, useful_count):
-    if useful_count >= 3 and score >= 7:
+def rating(score, useful):
+    if useful >= 3 and score >= 7:
         return "High"
-    if score >= 4:
-        return "Medium"
-    return "Low"
+    return "Medium" if score >= 4 else "Low"
 
 
 # ---------------------------------------------------------------------------
-#   Scan and rank
+#   Scan
 # ---------------------------------------------------------------------------
 
-def scan_xor_functions():
+def analyze_function(func_ea):
+    """Return a result row for a function containing XOR-like instructions."""
+    useful, zeroing, all_xor, dst_registers, back_edges = [], [], [], [], []
+    mix = rotate = insn_count = 0
+
+    for ea in idautils.FuncItems(func_ea):
+        insn = decode(ea)
+        if insn is None:
+            continue
+        insn_count += 1
+        itype = int(insn.itype)
+        mix += itype in ITYPES.mix
+        rotate += itype in ITYPES.rotate
+        if is_backward_branch(ea, insn, func_ea):
+            back_edges.append(ea)
+        if itype not in ITYPES.xor:
+            continue
+
+        all_xor.append(ea)
+        if is_zeroing_xor(insn):
+            zeroing.append(ea)
+        else:
+            useful.append(ea)
+            ops = explicit_operands(insn)
+            dst = register_of(ops[0]) if ops else None
+            if dst is not None:
+                dst_registers.append(dst)
+
+    if not all_xor:
+        return None
+
+    score = score_function(len(useful), mix, rotate, len(back_edges), dst_registers, insn_count)
+    first_ea = useful[0] if useful else all_xor[0]
+    return {
+        "ea": first_ea,
+        "name": func_name(func_ea),
+        "xor": len(all_xor),
+        "useful": len(useful),
+        "zeroing": len(zeroing),
+        "loops": len(back_edges),
+        "score": score,
+        "rating": rating(score, len(useful)),
+    }
+
+
+def scan():
     results = []
-    total_functions = 0
-    total_xor_insns = 0
-    total_self_xor_insns = 0
+    total = 0
+    ida_kernwin.clr_cancelled()
+    ida_kernwin.show_wait_box("NODELAY\nDecoding functions...")
+    try:
+        for func_ea in idautils.Functions():
+            total += 1
+            if total % 256 == 0:
+                if ida_kernwin.user_cancelled():
+                    log("Scan cancelled, results are partial.")
+                    break
+                ida_kernwin.replace_wait_box("Decoding functions... %d" % total)
+            try:
+                item = analyze_function(func_ea)
+            except Exception as exc:
+                log("Failed to scan 0x%X: %s" % (func_ea, exc))
+                continue
+            if item:
+                results.append(item)
+    finally:
+        ida_kernwin.hide_wait_box()
 
-    for func_ea in idautils.Functions():
-        total_functions += 1
-        xor_eas = []
-        useful_xor_eas = []
-        self_xor_eas = []
-        back_edge_eas = []
-        useful_dst_registers = []
-        mix_count = 0
-        rotate_count = 0
-        insn_count = 0
-
-        try:
-            for ea in idautils.FuncItems(func_ea):
-                insn = _decode_instruction(ea)
-                if insn is None:
-                    continue
-
-                insn_count += 1
-                itype = int(insn.itype)
-
-                if itype in MIX_ITYPES:
-                    mix_count += 1
-                if itype in SHIFT_ROTATE_ITYPES:
-                    rotate_count += 1
-                if _is_backward_branch(ea, insn, func_ea):
-                    back_edge_eas.append(ea)
-
-                if itype not in XOR_ITYPES:
-                    continue
-
-                xor_eas.append(ea)
-                if _is_self_xor(insn):
-                    self_xor_eas.append(ea)
-                else:
-                    useful_xor_eas.append(ea)
-                    dst_register = None
-                    ops = _explicit_operands(insn)
-                    if ops:
-                        dst_register = _operand_register(ops[0])
-                    if dst_register is not None:
-                        useful_dst_registers.append(dst_register)
-
-        except Exception as exc:
-            print("[XORFinder] Warning: failed to scan 0x%X: %s" % (func_ea, exc))
-            continue
-
-        if not xor_eas:
-            continue
-
-        total_xor_insns += len(xor_eas)
-        total_self_xor_insns += len(self_xor_eas)
-
-        score = _score_function(
-            len(useful_xor_eas), mix_count, rotate_count,
-            len(back_edge_eas), useful_dst_registers, insn_count
-        )
-
-        first_ea = useful_xor_eas[0] if useful_xor_eas else xor_eas[0]
-        results.append({
-            "func_ea": func_ea,
-            "name": _function_name(func_ea),
-            "xor_eas": xor_eas,
-            "useful_xor_eas": useful_xor_eas,
-            "self_xor_eas": self_xor_eas,
-            "back_edge_eas": back_edge_eas,
-            "insn_count": insn_count,
-            "mix_count": mix_count,
-            "rotate_count": rotate_count,
-            "score": score,
-            "rating": _rating(score, len(useful_xor_eas)),
-            "first_ea": first_ea,
-            "sample": _disasm(first_ea),
-        })
-
-    results.sort(key=lambda item: (
-        item["score"], len(item["useful_xor_eas"]), len(item["xor_eas"])
-    ), reverse=True)
-
-    return results, total_functions, total_xor_insns, total_self_xor_insns
+    results.sort(key=lambda r: (r["score"], r["useful"], r["xor"]), reverse=True)
+    return results, total
 
 
 # ---------------------------------------------------------------------------
-#   IDA UI chooser
+#   Chooser
 # ---------------------------------------------------------------------------
 
-class XORResultsChooser(ida_kernwin.Choose):
-    def __init__(self, results):
-        self.results = results
-        columns = [
-            ["Function", 28],
-            ["Function EA", 12],
-            ["XORs", 5],
-            ["Useful", 6],
-            ["Zeroing", 7],
-            ["Back edges", 10],
-            ["Score", 5],
-            ["Rating", 9],
-            ["First XOR / sample", 42],
-        ]
-        super(XORResultsChooser, self).__init__(WINDOW_TITLE, columns, flags=0)
+class ResultChooser(ida_kernwin.Choose):
+    """Rows are (ea, [cells...]); the Address column is added automatically."""
+
+    def __init__(self, title, columns, rows):
+        cols = [["Address", 14 | ida_kernwin.Choose.CHCOL_EA]] + columns
+        super().__init__(title, cols, flags=ida_kernwin.Choose.CH_QFLT)
+        self.rows = rows
 
     def OnGetSize(self):
-        return len(self.results)
+        return len(self.rows)
 
     def OnGetLine(self, n):
-        item = self.results[n]
-        return [
-            item["name"],
-            "%X" % item["func_ea"],
-            str(len(item["xor_eas"])),
-            str(len(item["useful_xor_eas"])),
-            str(len(item["self_xor_eas"])),
-            str(len(item["back_edge_eas"])),
-            str(item["score"]),
-            item["rating"],
-            "%X: %s" % (item["first_ea"], item["sample"]),
-        ]
+        ea, cells = self.rows[n]
+        return ["0x%X" % ea] + list(cells)
 
-    def OnSelectLine(self, n):
-        if 0 <= n < len(self.results):
-            ida_kernwin.jumpto(self.results[n]["first_ea"])
-
-        return (ida_kernwin.Choose.NOTHING_CHANGED, n)
+    def OnGetEA(self, n):
+        return self.rows[n][0]
 
 
-# Keep a global reference so Python does not garbage-collect the chooser.
-_xor_finder_chooser = None
+def show_results(results):
+    """Address = first non-zeroing XOR (or the first XOR if all are zeroing)."""
+    global _chooser
+    if not results:
+        log("No XOR-like instructions found.")
+        return
+    rows = [
+        (r["ea"], [r["name"], str(r["xor"]), str(r["useful"]), str(r["zeroing"]),
+                   str(r["loops"]), str(r["score"]), r["rating"], disasm(r["ea"])])
+        for r in results
+    ]
+    _chooser = ResultChooser(TITLE, COLUMNS, rows)
+    _chooser.Show()
 
+
+# ---------------------------------------------------------------------------
+#   Main
+# ---------------------------------------------------------------------------
 
 def main():
-    global _xor_finder_chooser
-
+    global ITYPES
     try:
-        _build_instruction_type_sets()
-    except Exception as exc:
-        message = "[XORFinder] Could not initialise instruction types: %s" % exc
-        print(message)
-        ida_kernwin.msg(message + "\n")
+        ITYPES = build_itypes()
+    except RuntimeError as exc:
+        log("Initialisation failed: %s" % exc)
         return
 
-    print("[XORFinder] Processor instruction types loaded: %d" % len(INSTRUCTION_NAMES))
-    print("[XORFinder] XOR-like itypes: %d" % len(XOR_ITYPES))
-    print("[XORFinder] Scanning analyzed functions with decode_insn()...")
-
-    results, total_functions, total_xor_insns, total_self_xor_insns = scan_xor_functions()
-
-    print("[XORFinder] Functions scanned: %d" % total_functions)
-    print("[XORFinder] Functions containing XOR-like instructions: %d" % len(results))
-    print("[XORFinder] XOR-like instructions found: %d" % total_xor_insns)
-    print("[XORFinder] Self-XOR/zeroing instructions: %d" % total_self_xor_insns)
-
-    if not results:
-        print("[XORFinder] No XOR-like instruction types found in analyzed functions.")
-        ida_kernwin.msg("[XORFinder] No XOR-like instruction types found.\n")
-        return
-
-    print("[XORFinder] Top candidates:")
-    for item in results[:20]:
-        print("  %s @ 0x%X | XOR=%d useful=%d zeroing=%d loops=%d score=%d (%s)" % (
-            item["name"], item["func_ea"], len(item["xor_eas"]),
-            len(item["useful_xor_eas"]), len(item["self_xor_eas"]),
-            len(item["back_edge_eas"]), item["score"], item["rating"]
-        ))
-
-    print("[XORFinder] Type-based heuristic; inspect candidates before drawing conclusions.")
-    _xor_finder_chooser = XORResultsChooser(results)
-    _xor_finder_chooser.Show(modal=False)
+    log("Instruction types: %d, XOR-like: %d" % (len(ITYPES.names), len(ITYPES.xor)))
+    results, total = scan()
+    log("Functions scanned: %d, with XOR: %d, XOR insns: %d (zeroing: %d)" % (
+        total, len(results),
+        sum(r["xor"] for r in results), sum(r["zeroing"] for r in results)))
+    show_results(results)
 
 
 if __name__ == "__main__":
