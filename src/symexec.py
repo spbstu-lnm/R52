@@ -64,9 +64,14 @@ for c in key_chars:
 
 # imitate args of sub_140001000(__int64 username, __int64 key)
 # x64 Windows -> args are passed via RCX and RDX
-# allocate memory for strings on angr heap
-username_ptr = state.heap.malloc(USERNAME_LEN)
-key_ptr = state.heap.malloc(KEY_LEN)
+# allocate memory for strings on angr heap.
+# Note: the default heap plugin is SimHeapBrk, a minimal brk()-style
+# heap that only exposes the low-level allocate()/release() primitives
+# -- it has no public malloc() method (that only exists on richer
+# plugins like SimHeapPTMalloc/SimHeapLibc). Since we just need raw
+# scratch buffers here, allocate() is the right call.
+username_ptr = state.heap.allocate(USERNAME_LEN)
+key_ptr = state.heap.allocate(KEY_LEN)
 
 state.memory.store(username_ptr, username_ast)
 state.memory.store(key_ptr, key_ast)
