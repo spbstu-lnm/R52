@@ -1,5 +1,13 @@
+# IMPORTANT (angr >= 10): claripy now ships bundled inside angr as a
+# Rust-backed rewrite (angr.rustylib.claripy), aliased to `angr.claripy`.
+# A separately pip-installed legacy `claripy` package (if still present
+# in the venv) is a DIFFERENT, type-incompatible implementation -- ASTs
+# built with it are not recognized by state.solver.add(), which is what
+# produces a misleading "expression must be a boolean" ClaripyTypeError
+# no matter which comparison helper you use. Always import claripy
+# through angr on angr 10+:
 import angr
-import claripy
+from angr import claripy
 
 # load the binary
 project = angr.Project("crackme18-2.exe", auto_load_libs=False)
