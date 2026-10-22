@@ -19,7 +19,7 @@ CHECK_FUNC_ADDR = 0x140001000  # address of sub_140001000 (the check wrapper fun
 # `call sub_140001000` inside DialogFunc. Grab this from IDA -- without
 # it, control never flows back into the caller and FIND_ADDR/AVOID_ADDR
 # (which live in DialogFunc) are unreachable.
-RETURN_ADDR = 0x140001XXX  # <-- FILL THIS IN from IDA
+RETURN_ADDR = 0x140001BC8  # <-- FILL THIS IN from IDA
 
 FIND_ADDR  = 0x140001BE6  # address of MessageBoxA (success path) in DialogFunc
 AVOID_ADDR = 0x140001DBF  # address of the failure branch / return
