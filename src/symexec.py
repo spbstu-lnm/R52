@@ -4,9 +4,16 @@ import claripy
 # load the binary
 project = angr.Project("crackme18-2.exe", auto_load_libs=False)
 
-# addresses from IDA
-START_ADDR = 0x140001000  # address of the check wrapper function
-FIND_ADDR  = 0x140001BE6  # address of MessageBoxA in DialogFunc
+# --- addresses from IDA ---
+CHECK_FUNC_ADDR = 0x140001000  # address of sub_140001000 (the check wrapper function)
+
+# RETURN_ADDR must be the address of the instruction *right after*
+# `call sub_140001000` inside DialogFunc. Grab this from IDA -- without
+# it, control never flows back into the caller and FIND_ADDR/AVOID_ADDR
+# (which live in DialogFunc) are unreachable.
+RETURN_ADDR = 0x140001BC8  # <-- FILL THIS IN from IDA
+
+FIND_ADDR  = 0x140001BE6  # address of MessageBoxA (success path) in DialogFunc
 AVOID_ADDR = 0x140001DBF  # address of the failure branch / return
 
 # lengths of symbolic variables
@@ -20,19 +27,32 @@ key_chars = [claripy.BVS(f'key_{i}', 8) for i in range(KEY_LEN)]
 username_ast = claripy.Concat(*username_chars)
 key_ast = claripy.Concat(*key_chars)
 
-# create the initial state at the entry point of the check function
-# TODO: change to call_state??
-state = project.factory.blank_state(addr=START_ADDR)
+# create a proper call state: this sets up the stack, the calling
+# convention registers, AND a fake return address we control, so that
+# when sub_140001000 returns, execution actually continues at
+# RETURN_ADDR inside DialogFunc instead of jumping to garbage.
+state = project.factory.call_state(
+    CHECK_FUNC_ADDR,
+    0, 0,            # placeholder args, overwritten below via rcx/rdx
+    ret_addr=RETURN_ADDR,
+)
 
-# limit the symbols to printable ASCII characters
-# (should speed up the solving process)
+# limit the symbols to printable ASCII characters.
+# The ClaripyTypeError here is NOT about signed vs. unsigned comparison
+# operators -- it happens the same way whether you use plain Python
+# operators or claripy.UGE/ULE. The real cause is that `c` is an 8-bit
+# BVS while the raw Python ints 0x20/0x7e aren't reliably coerced to a
+# matching 8-bit bitvector. Wrapping them explicitly as same-width BVV
+# fixes it regardless of which comparison helper is used on top.
+PRINTABLE_LOW = claripy.BVV(0x20, 8)
+PRINTABLE_HIGH = claripy.BVV(0x7e, 8)
+
 for c in username_chars:
-    # TODO: fix ClaripyTypeError
-    state.solver.add(claripy.UGE(c, 0x20))
-    state.solver.add(c <= 0x7e)
+    state.solver.add(claripy.UGE(c, PRINTABLE_LOW))
+    state.solver.add(claripy.ULE(c, PRINTABLE_HIGH))
 for c in key_chars:
-    state.solver.add(c >= 0x20)
-    state.solver.add(c <= 0x7e)
+    state.solver.add(claripy.UGE(c, PRINTABLE_LOW))
+    state.solver.add(claripy.ULE(c, PRINTABLE_HIGH))
 
 # imitate args of sub_140001000(__int64 username, __int64 key)
 # x64 Windows -> args are passed via RCX and RDX
@@ -48,6 +68,9 @@ state.regs.rdx = key_ptr
 
 # run simulation
 simulation = project.factory.simgr(state)
+
+# drop unconstrained states as we go so a bad jump doesn't silently
+# blow up exploration time/memory
 simulation.explore(find=FIND_ADDR, avoid=AVOID_ADDR)
 
 # check if a solution was found
