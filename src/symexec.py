@@ -21,14 +21,18 @@ username_ast = claripy.Concat(*username_chars)
 key_ast = claripy.Concat(*key_chars)
 
 # create the initial state at the entry point of the check function
+# TODO: change to call_state??
 state = project.factory.blank_state(addr=START_ADDR)
 
 # limit the symbols to printable ASCII characters
 # (should speed up the solving process)
 for c in username_chars:
-    state.solver.add(claripy.And(c >= 0x20, c <= 0x7e))
+    # TODO: fix ClaripyTypeError
+    state.solver.add(claripy.UGE(c, 0x20))
+    state.solver.add(c <= 0x7e)
 for c in key_chars:
-    state.solver.add(claripy.And(c >= 0x20, c <= 0x7e))
+    state.solver.add(c >= 0x20)
+    state.solver.add(c <= 0x7e)
 
 # imitate args of sub_140001000(__int64 username, __int64 key)
 # x64 Windows -> args are passed via RCX and RDX
