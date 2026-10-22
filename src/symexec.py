@@ -1,41 +1,62 @@
-#!/usr/bin/env python3
-import sys
-import argparse
-
 import angr
+import claripy
 
+# load the binary
+project = angr.Project("crackme18-2.exe", auto_load_libs=False)
 
-def main():
-    # Parse CLI arguments
-    args = parse_args()
+# addresses from IDA
+START_ADDR = 0x140001000  # address of the check wrapper function
+FIND_ADDR  = 0x140001BE6  # address of MessageBoxA in DialogFunc
+AVOID_ADDR = 0x140001DBF  # address of the failure branch / return
 
-    # Load binary
-    project = angr.Project(
-        args.binary,
-        ld_path=['/usr/lib/wine/i386-windows/'],
-        #auto_load_libs=False,
-    )
+# lengths of symbolic variables
+USERNAME_LEN = 32
+KEY_LEN = 32
 
-    # Check that angr identified it correctly
-    print(project.arch)      # architecture (e.g. <Arch AMD64 (LE)>)
-    print(project.simos)     # OS (<SimOS Windows>)
+# create symbolic variables for Username and Key (32 bytes each)
+username_chars = [claripy.BVS(f'user_{i}', 8) for i in range(USERNAME_LEN)]
+key_chars = [claripy.BVS(f'key_{i}', 8) for i in range(KEY_LEN)]
 
-    # Establish initial state and exploration manager
-    initial_state = project.factory.entry_state()
-    simulation = project.factory.simgr(initial_state)
+username_ast = claripy.Concat(*username_chars)
+key_ast = claripy.Concat(*key_chars)
 
-    # Explore the binary symbolically
-    simulation.explore(find=lambda s: b"Success" in s.posix.dumps(1))
+# create the initial state at the entry point of the check function
+state = project.factory.blank_state(addr=START_ADDR)
 
+# limit the symbols to printable ASCII characters
+# (should speed up the solving process)
+for c in username_chars:
+    state.solver.add(claripy.And(c >= 0x20, c <= 0x7e))
+for c in key_chars:
+    state.solver.add(claripy.And(c >= 0x20, c <= 0x7e))
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Symbolic execution of a binary using angr."
-    )
+# imitate args of sub_140001000(__int64 username, __int64 key)
+# x64 Windows -> args are passed via RCX and RDX
+# allocate memory for strings on angr heap
+username_ptr = state.heap.malloc(USERNAME_LEN)
+key_ptr = state.heap.malloc(KEY_LEN)
 
-    parser.add_argument("binary", help="Path to the binary to analyze.")
-    return parser.parse_args()
+state.memory.store(username_ptr, username_ast)
+state.memory.store(key_ptr, key_ast)
 
+state.regs.rcx = username_ptr
+state.regs.rdx = key_ptr
 
-if __name__ == "__main__":
-    sys.exit(main())
+# run simulation
+simulation = project.factory.simgr(state)
+simulation.explore(find=FIND_ADDR, avoid=AVOID_ADDR)
+
+# check if a solution was found
+if simulation.found:
+    solution_state = simulation.found[0]
+
+    # extract the concrete values of the symbolic variables
+    username_res = solution_state.solver.eval(username_ast, cast_to=bytes)
+    key_res = solution_state.solver.eval(key_ast, cast_to=bytes)
+
+    # trim the null bytes and decode to string
+    print(f"[+] Success!")
+    print(f"[+] Username: {username_res.split(b'\x00')[0].decode('utf-8', errors='ignore')}")
+    print(f"[+] Serial Key: {key_res.split(b'\x00')[0].decode('utf-8', errors='ignore')}")
+else:
+    print("[-] No solution found.")
