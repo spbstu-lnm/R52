@@ -19,7 +19,7 @@ CHECK_FUNC_ADDR = 0x140001000  # address of sub_140001000 (the check wrapper fun
 # `call sub_140001000` inside DialogFunc. Grab this from IDA -- without
 # it, control never flows back into the caller and FIND_ADDR/AVOID_ADDR
 # (which live in DialogFunc) are unreachable.
-RETURN_ADDR = 0x140001BC8  # <-- FILL THIS IN from IDA
+RETURN_ADDR = 0x140001XXX  # <-- FILL THIS IN from IDA
 
 FIND_ADDR  = 0x140001BE6  # address of MessageBoxA (success path) in DialogFunc
 AVOID_ADDR = 0x140001DBF  # address of the failure branch / return
@@ -70,11 +70,18 @@ for c in key_chars:
 # -- it has no public malloc() method (that only exists on richer
 # plugins like SimHeapPTMalloc/SimHeapLibc). Since we just need raw
 # scratch buffers here, allocate() is the right call.
-username_ptr = state.heap.allocate(USERNAME_LEN)
-key_ptr = state.heap.allocate(KEY_LEN)
+# +1 byte each for an explicit NUL terminator -- without it, any
+# strlen()-style loop in the binary has nothing to stop on (0x00 is
+# excluded by our printable-ASCII constraints) and keeps reading past
+# the buffer into unconstrained heap memory, which is what produced
+# the endless "Filling memory at 0xc0000040/41/42..." warnings.
+username_ptr = state.heap.allocate(USERNAME_LEN + 1)
+key_ptr = state.heap.allocate(KEY_LEN + 1)
 
 state.memory.store(username_ptr, username_ast)
+state.memory.store(username_ptr + USERNAME_LEN, claripy.BVV(0, 8))
 state.memory.store(key_ptr, key_ast)
+state.memory.store(key_ptr + KEY_LEN, claripy.BVV(0, 8))
 
 state.regs.rcx = username_ptr
 state.regs.rdx = key_ptr
